@@ -1,4 +1,5 @@
 //! Implementations of well-known USB classes.
+pub mod bluetooth_hci;
 pub mod cdc_acm;
 pub mod cdc_ncm;
 pub mod cmsis_dap_v2;
