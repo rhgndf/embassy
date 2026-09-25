@@ -23,7 +23,6 @@
 //! [`UsbDevice`](crate::UsbDevice). `btusb` also matches on the interface class, so
 //! this is not strictly required, but it is recommended.
 
-use core::cell::RefCell;
 use core::mem::MaybeUninit;
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -233,13 +232,7 @@ impl<'d, D: Driver<'d>> BluetoothHciClass<'d, D> {
     /// Returns the command length, or [`Error::BufferOverflow`] if `buf` is too
     /// small to hold the command.
     pub async fn read_command(&self, buf: &mut [u8]) -> Result<usize, Error> {
-        let cmd = self.shared.commands.receive().await;
-        let len = cmd.len as usize;
-        if buf.len() < len {
-            return Err(Error::BufferOverflow);
-        }
-        buf[..len].copy_from_slice(&cmd.data[..len]);
-        Ok(len)
+        read_command(self.shared, buf).await
     }
 
     /// Reads one HCI ACL packet from the bulk OUT endpoint.
@@ -248,32 +241,7 @@ impl<'d, D: Driver<'d>> BluetoothHciClass<'d, D> {
     /// reassembles a whole ACL packet. `buf` must be large enough to hold a
     /// whole ACL packet (see [`HCI_ACL_MAX_LEN`]).
     pub async fn read_acl(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        let mps = self.acl_out_ep.info().max_packet_size as usize;
-        let mut total = 0;
-        loop {
-            if buf.len() - total < mps {
-                return Err(Error::BufferOverflow);
-            }
-            let n = self.acl_out_ep.read(&mut buf[total..]).await?;
-            // The host may terminate transfers with zero-length packets; skip
-            // them while we haven't received any data yet.
-            if total == 0 && n == 0 {
-                continue;
-            }
-            total += n;
-            if total >= 4 {
-                let expected = 4 + u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize;
-                if total > expected {
-                    warn!(
-                        "bluetooth hci: received more ACL data than expected ({} > {})",
-                        total, expected
-                    );
-                }
-                if total >= expected {
-                    return Ok(total);
-                }
-            }
-        }
+        read_acl(&mut self.acl_out_ep, buf).await
     }
 
     /// Writes one HCI event to the interrupt IN endpoint.
@@ -293,21 +261,60 @@ impl<'d, D: Driver<'d>> BluetoothHciClass<'d, D> {
         write_chunked(&mut self.acl_in_ep, acl).await
     }
 
-    /// Split the class into a sender and a receiver.
+    /// Split the class into a sender, a command receiver and an ACL receiver.
     ///
     /// This allows concurrently sending (events and ACL data to the host) and
     /// receiving (commands and ACL data from the host) from separate tasks.
-    pub fn split(self) -> (Sender<'d, D>, Receiver<'d, D>) {
+    pub fn split(self) -> (Sender<'d, D>, CommandReceiver<'d>, AclReceiver<'d, D>) {
         (
             Sender {
                 event_ep: self.event_ep,
                 acl_in_ep: self.acl_in_ep,
             },
-            Receiver {
-                acl_out_ep: RefCell::new(self.acl_out_ep),
-                shared: self.shared,
+            CommandReceiver { shared: self.shared },
+            AclReceiver {
+                acl_out_ep: self.acl_out_ep,
             },
         )
+    }
+}
+
+async fn read_command(shared: &ControlShared, buf: &mut [u8]) -> Result<usize, Error> {
+    let cmd = shared.commands.receive().await;
+    let len = cmd.len as usize;
+    if buf.len() < len {
+        return Err(Error::BufferOverflow);
+    }
+    buf[..len].copy_from_slice(&cmd.data[..len]);
+    Ok(len)
+}
+
+async fn read_acl<E: EndpointOut>(ep: &mut E, buf: &mut [u8]) -> Result<usize, Error> {
+    let mps = ep.info().max_packet_size as usize;
+    let mut total = 0;
+    loop {
+        if buf.len() - total < mps {
+            return Err(Error::BufferOverflow);
+        }
+        let n = ep.read(&mut buf[total..]).await?;
+        // The host may terminate transfers with zero-length packets; skip
+        // them while we haven't received any data yet.
+        if total == 0 && n == 0 {
+            continue;
+        }
+        total += n;
+        if total >= 4 {
+            let expected = 4 + u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize;
+            if total > expected {
+                warn!(
+                    "bluetooth hci: received more ACL data than expected ({} > {})",
+                    total, expected
+                );
+            }
+            if total >= expected {
+                return Ok(total);
+            }
+        }
     }
 }
 
@@ -351,35 +358,34 @@ impl<'d, D: Driver<'d>> Sender<'d, D> {
     }
 }
 
-/// Bluetooth HCI packet receiver (host to device: commands and ACL data).
+/// Bluetooth HCI command receiver (host to device, over the control endpoint).
 ///
-/// `read_command` and `read_acl` take `&self`, so they can be awaited
-/// concurrently (for example with [`embassy_futures::select`]).
-///
-/// You can obtain a `Receiver` with [`BluetoothHciClass::split`].
-pub struct Receiver<'d, D: Driver<'d>> {
-    acl_out_ep: RefCell<D::EndpointOut>,
+/// You can obtain a `CommandReceiver` with [`BluetoothHciClass::split`].
+pub struct CommandReceiver<'d> {
     shared: &'d ControlShared,
 }
 
-impl<'d, D: Driver<'d>> Receiver<'d, D> {
-    /// Waits for the USB host to enable this interface.
-    pub async fn wait_connection(&mut self) {
-        self.acl_out_ep.get_mut().wait_enabled().await;
-    }
-
+impl<'d> CommandReceiver<'d> {
     /// Reads one HCI command received over the control endpoint.
     ///
     /// Returns the command length, or [`Error::BufferOverflow`] if `buf` is too
     /// small to hold the command.
     pub async fn read_command(&self, buf: &mut [u8]) -> Result<usize, Error> {
-        let cmd = self.shared.commands.receive().await;
-        let len = cmd.len as usize;
-        if buf.len() < len {
-            return Err(Error::BufferOverflow);
-        }
-        buf[..len].copy_from_slice(&cmd.data[..len]);
-        Ok(len)
+        read_command(self.shared, buf).await
+    }
+}
+
+/// Bluetooth HCI ACL packet receiver (host to device, over the bulk OUT endpoint).
+///
+/// You can obtain an `AclReceiver` with [`BluetoothHciClass::split`].
+pub struct AclReceiver<'d, D: Driver<'d>> {
+    acl_out_ep: D::EndpointOut,
+}
+
+impl<'d, D: Driver<'d>> AclReceiver<'d, D> {
+    /// Waits for the USB host to enable this interface.
+    pub async fn wait_connection(&mut self) {
+        self.acl_out_ep.wait_enabled().await;
     }
 
     /// Reads one HCI ACL packet from the bulk OUT endpoint.
@@ -387,31 +393,7 @@ impl<'d, D: Driver<'d>> Receiver<'d, D> {
     /// ACL packets can be split over multiple USB packets by the host; this
     /// reassembles a whole ACL packet. `buf` must be large enough to hold a
     /// whole ACL packet (see [`HCI_ACL_MAX_LEN`]).
-    pub async fn read_acl(&self, buf: &mut [u8]) -> Result<usize, Error> {
-        let mut ep = self.acl_out_ep.borrow_mut();
-        let mps = ep.info().max_packet_size as usize;
-        let mut total = 0;
-        loop {
-            if buf.len() - total < mps {
-                return Err(Error::BufferOverflow);
-            }
-            let n = ep.read(&mut buf[total..]).await?;
-            if total == 0 && n == 0 {
-                continue;
-            }
-            total += n;
-            if total >= 4 {
-                let expected = 4 + u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize;
-                if total > expected {
-                    warn!(
-                        "bluetooth hci: received more ACL data than expected ({} > {})",
-                        total, expected
-                    );
-                }
-                if total >= expected {
-                    return Ok(total);
-                }
-            }
-        }
+    pub async fn read_acl(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        read_acl(&mut self.acl_out_ep, buf).await
     }
 }

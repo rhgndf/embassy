@@ -1,7 +1,8 @@
 use core::cell::RefCell;
 use core::convert::Infallible;
-use core::future::Future;
+use core::future::{Future, poll_fn};
 use core::mem::MaybeUninit;
+use core::task::Poll;
 
 use aligned::{A4, Aligned};
 use bt_hci_transport::{PacketToController, ReadHciError};
@@ -550,16 +551,23 @@ impl<'d> BtDriver<'d> {
     /// If `buf` is too small to hold the packet, the packet is dropped and
     /// `Err(Error::Io(ErrorKind::InvalidInput))` is returned.
     pub async fn read_raw(&self, buf: &mut [u8]) -> Result<usize, Error> {
-        let ch = &mut *self.rx.borrow_mut();
-        let pkt = ch.receive().await;
-        if buf.len() < pkt.len {
+        poll_fn(|cx| {
+            let mut ch = self.rx.borrow_mut();
+            let pkt = match ch.poll_receive(cx) {
+                Poll::Ready(pkt) => pkt,
+                Poll::Pending => return Poll::Pending,
+            };
+            let res = if buf.len() < pkt.len {
+                // Drop the packet if it doesn't fit in the buffer.
+                Err(Error::Io(ErrorKind::InvalidInput))
+            } else {
+                buf[..pkt.len].copy_from_slice(&pkt.buf[..pkt.len]);
+                Ok(pkt.len)
+            };
             pkt.receive_done();
-            return Err(Error::Io(ErrorKind::InvalidInput));
-        }
-        buf[..pkt.len].copy_from_slice(&pkt.buf[..pkt.len]);
-        let len = pkt.len;
-        pkt.receive_done();
-        Ok(len)
+            Poll::Ready(res)
+        })
+        .await
     }
 
     /// Send a raw HCI packet to the controller.
@@ -569,11 +577,18 @@ impl<'d> BtDriver<'d> {
         if packet.is_empty() || packet.len() > BT_HCI_MTU {
             return Err(Error::Io(ErrorKind::InvalidInput));
         }
-        let ch = &mut *self.tx.borrow_mut();
-        let mut buf = ch.send().await;
-        buf.buf[..packet.len()].copy_from_slice(packet);
-        buf.len = packet.len();
-        buf.send_done();
+        poll_fn(|cx| {
+            let mut ch = self.tx.borrow_mut();
+            let mut slot = match ch.poll_send(cx) {
+                Poll::Ready(slot) => slot,
+                Poll::Pending => return Poll::Pending,
+            };
+            slot.buf[..packet.len()].copy_from_slice(packet);
+            slot.len = packet.len();
+            slot.send_done();
+            Poll::Ready(())
+        })
+        .await;
         Ok(())
     }
 }

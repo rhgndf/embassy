@@ -20,8 +20,7 @@ use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_futures::join::join3;
-use embassy_futures::select::{Either, select};
+use embassy_futures::join::join4;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
@@ -145,40 +144,48 @@ async fn main(spawner: Spawner) {
     // Build the builder.
     let mut usb = builder.build();
 
-    // Split the class into a sender (events + ACL to host) and a receiver
-    // (commands + ACL from host).
-    let (mut sender, mut receiver) = class.split();
+    // Split the class into a sender (events + ACL to host), a command receiver
+    // and an ACL receiver (both host to controller).
+    let (mut sender, cmd_rx, mut acl_rx) = class.split();
 
     // Run the USB device.
     let usb_fut = usb.run();
 
-    // Handle packets from the USB host to the Bluetooth controller.
-    let host_to_controller_fut = async {
+    // Forward HCI commands (control endpoint) to the Bluetooth controller.
+    // Commands only arrive when the host has configured the device, so there's
+    // no need to wait for a connection here.
+    let command_fut = async {
         let mut cmd_buf = [0u8; HCI_MTU];
+        loop {
+            match cmd_rx.read_command(&mut cmd_buf[1..]).await {
+                Ok(n) => {
+                    cmd_buf[0] = HCI_COMMAND;
+                    if let Err(_e) = bt_device.write_raw(&cmd_buf[..1 + n]).await {
+                        warn!("failed to send HCI command to controller");
+                    }
+                }
+                Err(_e) => {
+                    warn!("failed to read HCI command");
+                }
+            }
+        }
+    };
+
+    // Forward HCI ACL packets (bulk OUT) to the Bluetooth controller.
+    let acl_fut = async {
         let mut acl_buf = [0u8; HCI_MTU];
         loop {
-            receiver.wait_connection().await;
+            acl_rx.wait_connection().await;
             loop {
-                match select(
-                    receiver.read_command(&mut cmd_buf[1..]),
-                    receiver.read_acl(&mut acl_buf[1..]),
-                )
-                .await
-                {
-                    Either::First(Ok(n)) => {
-                        cmd_buf[0] = HCI_COMMAND;
-                        if let Err(_e) = bt_device.write_raw(&cmd_buf[..1 + n]).await {
-                            warn!("failed to send HCI command to controller");
-                        }
-                    }
-                    Either::Second(Ok(n)) => {
+                match acl_rx.read_acl(&mut acl_buf[1..]).await {
+                    Ok(n) => {
                         acl_buf[0] = HCI_ACL;
                         if let Err(_e) = bt_device.write_raw(&acl_buf[..1 + n]).await {
                             warn!("failed to send ACL packet to controller");
                         }
                     }
-                    Either::First(Err(_e)) | Either::Second(Err(_e)) => {
-                        // USB disconnected or buffer overflow; wait for reconnection.
+                    Err(_e) => {
+                        // USB disconnected; wait for reconnection.
                         break;
                     }
                 }
@@ -216,5 +223,5 @@ async fn main(spawner: Spawner) {
     };
 
     // Run everything concurrently.
-    join3(usb_fut, host_to_controller_fut, controller_to_host_fut).await;
+    join4(usb_fut, command_fut, acl_fut, controller_to_host_fut).await;
 }
