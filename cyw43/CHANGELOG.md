@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `bt-hci-transport` 0.1.0 support.
 - Preserve host-owned Bluetooth control bits under simultaneous WiFi and Bluetooth load.
 - Bluetooth uses interrupts instead of SPI polling
+- Add `BtDriver::read_raw` and `BtDriver::write_raw` for sending/receiving raw HCI packets.
 
 ## 0.7.0 - 2026-03-10
 

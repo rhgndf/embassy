@@ -541,6 +541,43 @@ impl embedded_io_async::Error for Error {
     }
 }
 
+impl<'d> BtDriver<'d> {
+    /// Receive a raw HCI packet from the controller.
+    ///
+    /// The packet starts with the H4 indicator byte (0x02 ACL, 0x04 event, ...).
+    /// Returns the packet length.
+    ///
+    /// If `buf` is too small to hold the packet, the packet is dropped and
+    /// `Err(Error::Io(ErrorKind::InvalidInput))` is returned.
+    pub async fn read_raw(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        let ch = &mut *self.rx.borrow_mut();
+        let pkt = ch.receive().await;
+        if buf.len() < pkt.len {
+            pkt.receive_done();
+            return Err(Error::Io(ErrorKind::InvalidInput));
+        }
+        buf[..pkt.len].copy_from_slice(&pkt.buf[..pkt.len]);
+        let len = pkt.len;
+        pkt.receive_done();
+        Ok(len)
+    }
+
+    /// Send a raw HCI packet to the controller.
+    ///
+    /// `packet` must start with the H4 indicator byte (0x01 command, 0x02 ACL, ...).
+    pub async fn write_raw(&self, packet: &[u8]) -> Result<(), Error> {
+        if packet.is_empty() || packet.len() > BT_HCI_MTU {
+            return Err(Error::Io(ErrorKind::InvalidInput));
+        }
+        let ch = &mut *self.tx.borrow_mut();
+        let mut buf = ch.send().await;
+        buf.buf[..packet.len()].copy_from_slice(packet);
+        buf.len = packet.len();
+        buf.send_done();
+        Ok(())
+    }
+}
+
 // ------------ bt-hci-transport ----------------
 
 impl From<ReadHciError<Infallible>> for Error {
